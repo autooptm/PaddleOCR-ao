@@ -1,0 +1,349 @@
+diff --git a/paddleocr/_pipelines/ocr.py b/paddleocr/_pipelines/ocr.py
+index a708a0e..8f79f69 100644
+--- a/paddleocr/_pipelines/ocr.py
++++ b/paddleocr/_pipelines/ocr.py
+@@ -37,6 +37,7 @@ from .._utils.langs import (
+     ESLAV_LANGS,
+     LATIN_LANGS,
+ )
++from .._utils.opt_rec import default_rec_batch_size, opt_4
+ from .._utils.logging import logger
+ from .base import PaddleXPipelineWrapper, PipelineCLISubcommandExecutor
+ from .utils import create_config_from_structure
+@@ -168,10 +169,15 @@ class PaddleOCR(PaddleXPipelineWrapper):
+             else:
+                 base_params[name] = val
+ 
++        if params["text_recognition_batch_size"] is None:
++            params["text_recognition_batch_size"] = default_rec_batch_size()
++
+         self._params = params
+ 
+         super().__init__(**base_params)
+ 
++        opt_4(self.paddlex_pipeline)
++
+     @property
+     def _paddlex_pipeline_name(self):
+         return "OCR"
+diff --git a/paddleocr/_utils/opt_ctc.py b/paddleocr/_utils/opt_ctc.py
+new file mode 100644
+index 0000000..b890f11
+--- /dev/null
++++ b/paddleocr/_utils/opt_ctc.py
+@@ -0,0 +1,98 @@
++# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import os
++
++from .logging import logger
++
++ENV_SWITCH = "PADDLEOCR_OPT_1"
++
++
++def _enabled():
++    return os.environ.get(ENV_SWITCH, "1").strip().lower() not in ("0", "false", "off", "no")
++
++
++def opt_3(paddlex_pipeline):
++    """Install the device-side CTC reduction on an OCR pipeline's text recognizer.
++
++    Returns True when installed. Anything unexpected (CPU device, another engine,
++    another runner, a model without a CTC head) leaves the stock path untouched."""
++    if not _enabled():
++        return False
++    try:
++        pipeline = getattr(paddlex_pipeline, "_pipeline", paddlex_pipeline)
++        rec = getattr(pipeline, "text_rec_model", None)
++        runner = getattr(rec, "runner", None)
++        post_op = getattr(rec, "post_op", None)
++        if runner is None or post_op is None or not hasattr(post_op, "decode"):
++            return False
++        if (getattr(runner, "_config", None) or {}).get("device_type") != "gpu":
++            return False
++        if str((getattr(runner, "_config", None) or {}).get("run_mode", "paddle")).startswith("trt"):
++            return False
++        predictor = getattr(runner, "predictor", None)
++        if predictor is None:
++            predictor = runner.infer.predictor
++        import numpy as np
++        import paddle
++
++        place = paddle.CUDAPlace(int(runner._config.get("device_id") or 0))
++    except Exception as e:  # noqa: BLE001
++        logger.debug("optimized CTC path not installed: %s", e)
++        return False
++
++    def opt_7(x):
++        inputs = [
++            paddle.to_tensor(np.ascontiguousarray(a), place=place) for a in x
++        ]
++        probs = predictor.run(inputs)[0]
++        return _Opt5(
++            paddle.argmax(probs, axis=-1).numpy(), paddle.max(probs, axis=-1).numpy()
++        )
++
++    rec.runner = opt_7
++    rec.post_op = _Opt6(post_op)
++    return True
++
++
++class _Opt5:
++    __slots__ = ("idx", "prob")
++
++    def __init__(self, idx, prob):
++        self.idx, self.prob = idx, prob
++
++
++class _Opt6:
++
++    def __init__(self, stock):
++        self.stock = stock
++
++    def __call__(self, pred, return_word_box=False, **kwargs):
++        if not isinstance(pred, _Opt5):
++            return self.stock(pred, return_word_box=return_word_box, **kwargs)
++        text = self.stock.decode(
++            pred.idx,
++            pred.prob,
++            is_remove_duplicate=True,
++            return_word_box=return_word_box,
++        )
++        if return_word_box:
++            for rec_idx, rec in enumerate(text):
++                wh_ratio = kwargs["wh_ratio_list"][rec_idx]
++                max_wh_ratio = kwargs["max_wh_ratio"]
++                rec[2][0] = rec[2][0] * (wh_ratio / max_wh_ratio)
++        texts = [t[0] if len(t) <= 2 else (t[0], t[2]) for t in text]
++        scores = [t[1] for t in text]
++        return texts, scores
+diff --git a/paddleocr/_utils/opt_rec.py b/paddleocr/_utils/opt_rec.py
+new file mode 100644
+index 0000000..f99b474
+--- /dev/null
++++ b/paddleocr/_utils/opt_rec.py
+@@ -0,0 +1,199 @@
++# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import math
++import os
++
++from .logging import logger
++
++ENV_SWITCH = "PADDLEOCR_OPT_2"
++BATCH_ENV = "PADDLEOCR_REC_BATCH_SIZE"
++DEFAULT_REC_BATCH_SIZE = 20
++
++
++def default_rec_batch_size():
++    """Recognition batch size used when the caller passes none: 20 (fewer predictor runs
++    per page), or the pipeline's own default when PADDLEOCR_REC_BATCH_SIZE=0."""
++    v = os.environ.get(BATCH_ENV, str(DEFAULT_REC_BATCH_SIZE)).strip()
++    try:
++        n = int(v)
++    except ValueError:
++        return DEFAULT_REC_BATCH_SIZE
++    return n if n > 0 else None
++
++
++def _mode():
++    v = os.environ.get(ENV_SWITCH, "1").strip().lower()
++    if v in ("0", "false", "off", "no"):
++        return None
++    return "ctc" if v == "ctc" else "full"
++
++
++def opt_4(paddlex_pipeline):
++    """Install the device-side recognition path on an OCR pipeline's text recognizer.
++
++    Returns the installed mode ("full" / "ctc") or None. Anything unexpected (CPU device,
++    TensorRT or another engine, a static rec input shape, a non-CTC head) leaves the stock
++    path untouched."""
++    mode = _mode()
++    if mode is None:
++        return None
++    try:
++        pipeline = getattr(paddlex_pipeline, "_pipeline", paddlex_pipeline)
++        rec = getattr(pipeline, "text_rec_model", None)
++        runner = getattr(rec, "runner", None)
++        post_op = getattr(rec, "post_op", None)
++        if runner is None or post_op is None or not hasattr(post_op, "decode"):
++            return None
++        cfg = getattr(runner, "_config", None) or {}
++        if cfg.get("device_type") != "gpu" or str(cfg.get("run_mode", "paddle")).startswith("trt"):
++            return None
++        if getattr(rec, "input_shape", None) is not None:
++            mode = "ctc"
++        predictor = getattr(runner, "predictor", None)
++        if predictor is None:
++            predictor = runner.infer.predictor
++        shape = next(
++            op["RecResizeImg"]["image_shape"]
++            for op in rec.config["PreProcess"]["transform_ops"]
++            if "RecResizeImg" in op
++        )
++        import numpy as np
++        import paddle
++
++        place = paddle.CUDAPlace(int(cfg.get("device_id") or 0))
++    except Exception as e:  # noqa: BLE001
++        logger.debug("optimized text recognition path not installed: %s", e)
++        return None
++
++    if mode == "ctc":
++
++        def opt_7(x):
++            inputs = [paddle.to_tensor(np.ascontiguousarray(a), place=place) for a in x]
++            return _reduce(paddle, predictor.run(inputs)[0])
++
++        rec.runner = opt_7
++        rec.post_op = _Opt6(post_op)
++        return mode
++
++    rec.process = _Opt8(rec, predictor, post_op, shape, place)
++    return mode
++
++
++def _reduce(paddle, probs):
++    return _Opt5(
++        paddle.argmax(probs, axis=-1).numpy(), paddle.max(probs, axis=-1).numpy()
++    )
++
++
++class _Opt5:
++    __slots__ = ("idx", "prob")
++
++    def __init__(self, idx, prob):
++        self.idx, self.prob = idx, prob
++
++
++def _texts_scores(text):
++    return [t[0] if len(t) <= 2 else (t[0], t[2]) for t in text], [t[1] for t in text]
++
++
++class _Opt6:
++
++    def __init__(self, stock):
++        self.stock = stock
++
++    def __call__(self, pred, return_word_box=False, **kwargs):
++        if not isinstance(pred, _Opt5):
++            return self.stock(pred, return_word_box=return_word_box, **kwargs)
++        text = self.stock.decode(
++            pred.idx, pred.prob, is_remove_duplicate=True, return_word_box=return_word_box
++        )
++        if return_word_box:
++            for rec_idx, rec in enumerate(text):
++                rec[2][0] = rec[2][0] * (
++                    kwargs["wh_ratio_list"][rec_idx] / kwargs["max_wh_ratio"]
++                )
++        return _texts_scores(text)
++
++
++class _Opt8:
++
++    max_imgW = 3200
++
++    def __init__(self, rec, predictor, post_op, shape, place):
++        self.rec, self.predictor, self.post_op, self.place = rec, predictor, post_op, place
++        self.imgC, self.imgH, self.imgW = shape[:3]
++
++    def _batch(self, imgs):
++        import cv2
++        import numpy as np
++        import paddle
++
++        imgH = self.imgH
++        items = []
++        for img in imgs:
++            h, w = img.shape[:2]
++            ratio = w / float(h)
++            width = int(imgH * max(self.imgW / imgH, ratio))
++            if width > self.max_imgW:
++                width = resized_w = self.max_imgW
++            elif math.ceil(imgH * ratio) > width:
++                resized_w = width
++            else:
++                resized_w = int(math.ceil(imgH * ratio))
++            items.append((cv2.resize(img, (resized_w, imgH)), resized_w, width))
++        max_w = max(width for _, _, width in items)
++        buf = np.zeros((len(items), imgH, max_w, self.imgC), np.uint8)
++        widths = np.zeros((len(items), 1, 1, 1), np.int64)
++        for i, (resized, resized_w, _) in enumerate(items):
++            buf[i, :, :resized_w] = resized
++            widths[i] = resized_w
++        x = paddle.transpose(
++            paddle.to_tensor(buf, place=self.place).astype("float32"), [0, 3, 1, 2]
++        )
++        x = (x / 255.0 - 0.5) / 0.5
++        cols = paddle.arange(max_w, dtype="int64").reshape([1, 1, 1, max_w])
++        keep = cols < paddle.to_tensor(widths, place=self.place)
++        return paddle.where(keep, x, paddle.zeros_like(x))
++
++    def __call__(self, batch_data, return_word_box=False, **kwargs):
++        import numpy as np
++        import paddle
++
++        rec = self.rec
++        raw = rec.pre_tfs["Read"](imgs=batch_data.instances)
++        pred = _reduce(paddle, self.predictor.run([self._batch(raw)])[0])
++        return_word_box = return_word_box or rec.return_word_box
++        text = self.post_op.decode(
++            pred.idx, pred.prob, is_remove_duplicate=True, return_word_box=return_word_box
++        )
++        if return_word_box:
++            order = np.argsort(np.array([im.shape[1] / float(im.shape[0]) for im in raw]))
++            max_wh_ratio, wh_ratios = self.imgW / self.imgH, []
++            for ino in range(min(len(raw), rec.batch_sampler.batch_size)):
++                h, w = raw[order[ino]].shape[:2]
++                max_wh_ratio = max(max_wh_ratio, w / h)
++                wh_ratios.append(w / h)
++            for i, r in enumerate(text):
++                r[2][0] = r[2][0] * (wh_ratios[i] / max_wh_ratio)
++        texts, scores = _texts_scores(text)
++        return {
++            "input_path": batch_data.input_paths,
++            "page_index": batch_data.page_indexes,
++            "input_img": raw,
++            "rec_text": texts,
++            "rec_score": scores,
++            "vis_font": [rec.vis_font] * len(raw),
++        }
+diff --git a/run_ocr.py b/run_ocr.py
+new file mode 100644
+index 0000000..7ef2f01
+--- /dev/null
++++ b/run_ocr.py
+@@ -0,0 +1,6 @@
++from paddleocr import PaddleOCR
++ocr = PaddleOCR(use_doc_orientation_classify=False,
++                use_doc_unwarping=False,
++                use_textline_orientation=False)
++for img in __import__("sys").argv[1:] or ["general_ocr_002.png"]:
++    result = ocr.ocr(img)

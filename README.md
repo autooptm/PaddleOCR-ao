@@ -1,3 +1,74 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>PaddleOCR · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.29x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.29x-2ea44f"></a>
+    <a href="https://github.com/PaddlePaddle/PaddleOCR/commit/dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf"><img alt="base" src="https://img.shields.io/badge/upstream-dab3fe353790-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) at commit
+> [`dab3fe353790`](https://github.com/PaddlePaddle/PaddleOCR/commit/dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf).
+> **The program measured here is not upstream code**: `run_ocr.py` does not exist upstream. It is a
+> four-line script that builds `PaddleOCR(...)` with document orientation, unwarping and text-line
+> orientation turned off (PP-OCRv6 medium detection + recognition) and runs `ocr.ocr("general_ocr_002.png")`
+> on PaddleOCR's demo page. The commit on top of upstream adds that program and applies the AutoOptm
+> patch, which changes both the program and PaddleOCR's own pipeline code (listed below). The patch
+> against upstream is kept at
+> [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python run_ocr.py`, one page per launch as submitted; measured as `python run_ocr.py <image> <image> ...` with 220 images in one process, the multi-image form this fork adds (with no arguments the program does exactly what it did) |
+| **Entry point** | `run_ocr.py` (added by this fork) |
+| **Unit measured** | one image through the OCR pipeline: read and decode → text detection → box post-processing → text recognition → CTC decode; 11 real OCR images in a fixed order × 20 (220 timed, after 22 untimed warm-up images) |
+| **Before (stock PaddleOCR, same program)** | 279 ms per image (70.96 s for the timed 220-image loop) |
+| **After (this tree, all switches default ON)** | 79.6 ms per image (21.59 s for the timed loop) |
+| **Speedup** | **3.29x** end to end on RTX 4090 (timed loop; the per-image median is 3.51x), noise floor of the host 0.30% |
+| **Output** | recognized text and text-box geometry identical to stock on the held-out images; on the most sensitive pinned page the text/box encoding moves by relative L2 0.054 (cosine 0.9986), about one or two recognized characters, because a text line is now recognized alongside different neighbours; one switch in `paddleocr/_pipelines/ocr.py` restores output bit-identical to stock; verified on the pinned images and on a held-out set the optimiser never saw |
+
+A single-page launch is dominated by ~5.8 s of model loading, which this patch does not change;
+the speedup applies to the per-image work.
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `paddleocr/_utils/opt_rec.py` (new) | `opt_4()` / `_Opt8`, installed from `PaddleOCR.__init__` in `paddleocr/_pipelines/ocr.py` | 2.24x |
+| `paddleocr/_pipelines/ocr.py` | `PaddleOCR.__init__`: the text-recognition default when the caller passes none | 1.27x |
+| `run_ocr.py` | the `ocr.ocr` call: several images per process | — (how the run is measured) |
+| `paddleocr/_utils/opt_ctc.py` (new) | not imported by the default path | — |
+
+Each gain is measured on top of the rows above it.
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/PaddleOCR-ao.git
+cd PaddleOCR-ao
+# install PaddlePaddle (GPU) and this package (pip install -e .) as upstream documents, then:
+wget https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/general_ocr_002.png
+python run_ocr.py                        # the submitted command: one page
+python run_ocr.py a.png b.jpg c.png ...  # many images in one process (what was measured)
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it. It adds `run_ocr.py` and the two new
+modules under `paddleocr/_utils/` (all added by this fork) and changes PaddleOCR's pipeline code;
+`git diff dab3fe353790` is the same change as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 
 <div align="center">
   <p>

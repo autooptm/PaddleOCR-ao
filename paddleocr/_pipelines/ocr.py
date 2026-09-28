@@ -37,6 +37,7 @@ from .._utils.langs import (
     ESLAV_LANGS,
     LATIN_LANGS,
 )
+from .._utils.opt_rec import default_rec_batch_size, opt_4
 from .._utils.logging import logger
 from .base import PaddleXPipelineWrapper, PipelineCLISubcommandExecutor
 from .utils import create_config_from_structure
@@ -168,9 +169,14 @@ class PaddleOCR(PaddleXPipelineWrapper):
             else:
                 base_params[name] = val
 
+        if params["text_recognition_batch_size"] is None:
+            params["text_recognition_batch_size"] = default_rec_batch_size()
+
         self._params = params
 
         super().__init__(**base_params)
+
+        opt_4(self.paddlex_pipeline)
 
     @property
     def _paddlex_pipeline_name(self):
